@@ -11,13 +11,18 @@ from typing import Optional, Tuple, List
 from dataclasses import dataclass
 import os
 import subprocess
+import requests
+import threading
+from threading import Lock
+import json
+import pygame
 
 @dataclass
 class HitZone:
     """Represents a target zone on the mannequin"""
     name: str
     center: Tuple[int, int]
-    radius: int
+    size: int  # Changed from radius to size for square boxes
     color: Tuple[int, int, int]
     active: bool = True
     hit_damage: int = 10
@@ -75,6 +80,10 @@ class BoxingGameDetector:
         self.hit_effects = []  # Store hit effect animations
         self.punch_speed_threshold = 50  # pixels per frame for punch detection
         
+        # Game-style hit zones
+        self.base_zones = []  # Store base zone positions
+        self.zones_need_repositioning = True  # Flag to trigger initial setup
+        
         # FPS tracking
         self.fps_counter = 0
         self.fps_start_time = time.time()
@@ -104,8 +113,39 @@ class BoxingGameDetector:
             'duration': 3.0,
             'portrait': None,
             'video_cap': None,
-            'audio_proc': None
+            'audio_proc': None,
+            'fullscreen_mode': False,
+            'frame_buffer': None,
+            'video_fps': 30.0,
+            'last_frame_time': 0,
+            'end_delay': 1.0  # Extra delay at end to ensure full playback
         }
+        
+        # Background Music System
+        self.music_initialized = False
+        self.music_volume = 0.3  # Soft volume (30%)
+        self.music_file = os.path.join(os.path.dirname(__file__), "music", "bg_theme.mp3")
+        self.music_playing = False
+        
+        # Initialize background music
+        self._init_background_music()
+        
+        # ESP32 Health System
+        self.esp32_ip = "172.20.10.2"
+        self.esp32_health = 100  # Local cache of ESP32 health
+        self.esp32_lock = Lock()  # Thread safety for health updates
+        self.esp32_last_fetch = 0
+        self.esp32_fetch_interval = 0.1  # Fetch every 100ms for low latency
+        self.esp32_connected = False
+        self.esp32_thread = None
+        self.esp32_running = True
+        self.previous_health = 100  # Track previous health to detect changes
+        
+        # Start ESP32 health monitoring thread
+        self._start_esp32_monitoring()
+        
+        # Initialize ESP32 health after a short delay to allow monitoring to start
+        threading.Timer(0.5, self.initialize_esp32_health).start()
         
     def detect_and_process(self, frame: np.ndarray) -> np.ndarray:
         """Main detection and game logic - with frame validation"""
@@ -117,6 +157,10 @@ class BoxingGameDetector:
         # Create game frame first
         game_frame = frame.copy()
         
+        # If cutscene is playing, only show cutscene (disable all game processing)
+        if self.cutscene_overlay['active']:
+            return self._render_fullscreen_cutscene(game_frame)
+        
         try:
             # Only process every 3rd frame to reduce load
             self.fps_counter += 1
@@ -125,14 +169,6 @@ class BoxingGameDetector:
                 self._draw_hit_zones(game_frame)
                 self._draw_hit_effects(game_frame)
                 self._draw_hud(game_frame)
-                # Always draw overlay if active
-                if self.cutscene_overlay['active']:
-                    self._draw_cutscene_overlay(game_frame)
-                    # Check overlay expiry
-                    if time.time() - self.cutscene_overlay['start_time'] >= self.cutscene_overlay['duration']:
-                        self.cutscene_overlay['active'] = False
-                        self.cutscene_playing = False
-                        self._advance_to_next_boss()
                 return game_frame
             
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -176,13 +212,6 @@ class BoxingGameDetector:
             self._draw_hit_zones(game_frame)
             self._draw_hit_effects(game_frame)
             self._draw_hud(game_frame)
-            # Draw cutscene overlay if active
-            if self.cutscene_overlay['active']:
-                self._draw_cutscene_overlay(game_frame)
-                if time.time() - self.cutscene_overlay['start_time'] >= self.cutscene_overlay['duration']:
-                    self.cutscene_overlay['active'] = False
-                    self.cutscene_playing = False
-                    self._advance_to_next_boss()
         except Exception as e:
             print(f"Drawing error: {e}")
         
@@ -193,8 +222,9 @@ class BoxingGameDetector:
         return game_frame
     
     def _setup_hit_zones(self, frame, landmarks):
-        """Setup hit zones based on detected mannequin pose"""
+        """Setup hit zones with game-style variation"""
         h, w = frame.shape[:2]
+        current_time = time.time()
 
         # Helper to smooth a landmark to pixel coordinates using EMA
         def smooth_landmark(name, lm):
@@ -207,7 +237,7 @@ class BoxingGameDetector:
             self.landmark_smooth[name] = (x_px, y_px)
             return x_px, y_px
 
-        # Get key landmarks with smoothing
+        # Get key landmarks with smoothing for base positioning
         nose = landmarks.landmark[self.mp_pose.PoseLandmark.NOSE]
         left_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
         right_shoulder = landmarks.landmark[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
@@ -220,48 +250,61 @@ class BoxingGameDetector:
         torso_width = max(20, int(abs(ls_x - rs_x)))
         self.torso_size = int(torso_width * 1.6)
 
-        # Chest position slightly below shoulder midpoint
-        chest_x = int((ls_x + rs_x) / 2)
-        chest_y = int((ls_y + rs_y) / 2 + self.torso_size * 0.12)
+        # Store base positions ONLY if not set or if zones need repositioning (after hit)
+        if not self.base_zones or self.zones_need_repositioning:
+            chest_x = int((ls_x + rs_x) / 2)
+            chest_y = int((ls_y + rs_y) / 2 + self.torso_size * 0.12)
+            
+            # Add random variation ONLY when repositioning
+            head_offset_x = random.randint(-40, 40)
+            head_offset_y = random.randint(-20, 20)
+            chest_offset_x = random.randint(-40, 40)
+            chest_offset_y = random.randint(-20, 20)
+            
+            self.base_zones = [
+                {
+                    'name': 'HEAD', 
+                    'base_pos': (head_x + head_offset_x, head_y + head_offset_y), 
+                    'damage': 20, 
+                    'color': (255, 100, 100)
+                },
+                {
+                    'name': 'CHEST', 
+                    'base_pos': (chest_x + chest_offset_x, chest_y + chest_offset_y), 
+                    'damage': 15, 
+                    'color': (100, 255, 255)
+                },
+            ]
+            self.zones_need_repositioning = False
+            print(f"🎯 Repositioned hit zones - HEAD: ({head_x + head_offset_x}, {head_y + head_offset_y}), CHEST: ({chest_x + chest_offset_x}, {chest_y + chest_offset_y})")
 
-        # Clear existing zones and create scaled ones
+        # Clear existing zones and create new ones using FIXED positions
         self.hit_zones.clear()
-        current_time = time.time()
 
-        # Enlarge zones slightly to make hits easier
-        head_radius = max(36, int(self.torso_size * 0.32))
-        chest_radius = max(60, int(self.torso_size * 0.48))
-
-        self.hit_zones.append(HitZone(
-            name="HEAD",
-            center=(head_x, head_y),
-            radius=head_radius,
-            color=(0, 0, 255),
-            hit_damage=20,
-            last_hit_time=getattr(self, 'head_last_hit', 0)
-        ))
-
-        self.hit_zones.append(HitZone(
-            name="CHEST",
-            center=(chest_x, chest_y),
-            radius=chest_radius,
-            color=(0, 255, 255),
-            hit_damage=15,
-            last_hit_time=getattr(self, 'chest_last_hit', 0)
-        ))
+        for zone_info in self.base_zones:
+            # Use the stored fixed position - NO random variation here
+            final_x, final_y = zone_info['base_pos']
+            
+            # Ensure zones stay within frame bounds
+            final_x = max(50, min(w-50, final_x))
+            final_y = max(50, min(h-50, final_y))
+            
+            # Square hit zones - size based on torso
+            zone_size = max(60, int(self.torso_size * 0.4))
+            
+            self.hit_zones.append(HitZone(
+                name=zone_info['name'],
+                center=(final_x, final_y),
+                size=zone_size,
+                color=zone_info['color'],
+                hit_damage=zone_info['damage'],
+                last_hit_time=getattr(self, f"{zone_info['name'].lower()}_last_hit", 0)
+            ))
     
     def _draw_mannequin(self, frame, landmarks):
-        """Draw mannequin pose"""
-        # Draw pose landmarks in a subtle way
-        self.mp_drawing.draw_landmarks(
-            frame,
-            landmarks,
-            self.mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
-                color=(100, 100, 100), thickness=1, circle_radius=2),
-            connection_drawing_spec=mp.solutions.drawing_utils.DrawingSpec(
-                color=(150, 150, 150), thickness=2)
-        )
+        """Draw mannequin pose - simplified for game aesthetic"""
+        # Don't draw pose landmarks for cleaner game look
+        pass
     
     def _process_hands(self, frame, hand_landmarks):
         """Process player hand positions and movements"""
@@ -302,8 +345,7 @@ class BoxingGameDetector:
             else:
                 self.hand_velocities.append((dx, dy))
 
-            # Draw hand tracking (smoothed)
-            cv2.circle(frame, (sx, sy), 15, (0, 255, 0), 3)
+            # Don't draw hand tracking for cleaner game look
 
     
     def _check_hits(self):
@@ -317,7 +359,7 @@ class BoxingGameDetector:
 
             hand_speed = math.sqrt(dx * dx + dy * dy)
 
-            # Scale threshold by torso size so users at different distances work
+            # Scale threshold to torso size so users at different distances work
             adaptive_threshold = max(8, int(self.base_punch_speed * (self.torso_size / 200.0)))
 
             # Only consider a punch if the speed exceeds adaptive threshold
@@ -335,8 +377,8 @@ class BoxingGameDetector:
                 dist = math.hypot(vx, vy)
 
                 # Allow a small margin so near-misses still count
-                margin = max(8, int(zone.radius * 0.12))
-                if dist > (zone.radius + margin):
+                margin = max(8, int(zone.size * 0.12))
+                if dist > (zone.size//2 + margin):
                     continue
 
                 # Normalize approach vector and velocity to compute dot product
@@ -375,8 +417,9 @@ class BoxingGameDetector:
         torso_factor = max(0.9, min(1.3, self.torso_size / 200.0))
         damage = int(zone.hit_damage * speed_multiplier * torso_factor)
 
-        # Update game state
-        self.mannequin_health = max(0, self.mannequin_health - damage)
+        # NOTE: Health is now managed by ESP32, not directly modified here
+        # The ESP32 will handle damage application and health reduction
+        # We just track score and combo locally
         self.score += damage * 10
         
         # Update combo
@@ -398,6 +441,9 @@ class BoxingGameDetector:
         
         print(f"🥊 {zone.name} HIT! Damage: {damage}, Speed: {speed:.1f}, Combo: {self.combo_count}")
 
+        # Note: Zone repositioning will be triggered automatically when ESP32 health changes
+        # No need to set zones_need_repositioning here since health changes are detected in ESP32 monitor
+
         # If boss health reaches zero, handle defeat
         if self.mannequin_health <= 0 and self.campaign_active and not self.cutscene_playing:
             # Mark boss defeated
@@ -414,7 +460,7 @@ class BoxingGameDetector:
                 self._advance_to_next_boss()
     
     def _draw_hit_zones(self, frame):
-        """Draw target zones"""
+        """Draw target zones as game-style squares"""
         current_time = time.time()
         
         for zone in self.hit_zones:
@@ -425,30 +471,58 @@ class BoxingGameDetector:
             time_since_hit = current_time - zone.last_hit_time
             alpha = min(time_since_hit / zone.hit_cooldown, 1.0)
             
-            # Zone color (darker when on cooldown)
-            color = tuple(int(c * alpha) for c in zone.color)
+            # Zone color with pulsing effect for active zones
+            base_color = zone.color
+            if alpha >= 1.0:
+                # Add pulsing effect when zone is ready
+                pulse = (math.sin(current_time * 4) + 1) * 0.3 + 0.4  # 0.4 to 1.0
+                color = tuple(int(c * pulse) for c in base_color)
+            else:
+                # Dim when on cooldown
+                color = tuple(int(c * alpha * 0.5) for c in base_color)
             
-            # Draw zone circle
-            cv2.circle(frame, zone.center, zone.radius, color, 3)
+            # Draw square zone
+            half_size = zone.size // 2
+            top_left = (zone.center[0] - half_size, zone.center[1] - half_size)
+            bottom_right = (zone.center[0] + half_size, zone.center[1] + half_size)
             
-            # Draw zone label
-            label_pos = (zone.center[0] - 30, zone.center[1] - zone.radius - 10)
-            cv2.putText(frame, zone.name, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, color, 2)
+            # Outer glow effect
+            if alpha >= 1.0:
+                glow_size = half_size + 8
+                glow_color = tuple(int(c * 0.3) for c in color)
+                cv2.rectangle(frame, 
+                            (zone.center[0] - glow_size, zone.center[1] - glow_size),
+                            (zone.center[0] + glow_size, zone.center[1] + glow_size),
+                            glow_color, 4)
             
-            # Draw crosshair in center
-            cross_size = 10
-            cv2.line(frame, 
-                    (zone.center[0] - cross_size, zone.center[1]),
-                    (zone.center[0] + cross_size, zone.center[1]), 
-                    color, 2)
-            cv2.line(frame, 
-                    (zone.center[0], zone.center[1] - cross_size),
-                    (zone.center[0], zone.center[1] + cross_size), 
-                    color, 2)
+            # Main zone rectangle
+            cv2.rectangle(frame, top_left, bottom_right, color, 4)
+            
+            # Inner targeting reticle
+            if alpha >= 1.0:
+                reticle_size = half_size // 3
+                # Horizontal line
+                cv2.line(frame,
+                        (zone.center[0] - reticle_size, zone.center[1]),
+                        (zone.center[0] + reticle_size, zone.center[1]),
+                        color, 2)
+                # Vertical line
+                cv2.line(frame,
+                        (zone.center[0], zone.center[1] - reticle_size),
+                        (zone.center[0], zone.center[1] + reticle_size),
+                        color, 2)
+            
+            # Zone damage indicator
+            damage_text = f"{zone.hit_damage}"
+            text_size = cv2.getTextSize(damage_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+            text_pos = (zone.center[0] - text_size[0]//2, zone.center[1] + text_size[1]//2)
+            
+            if alpha >= 1.0:
+                cv2.putText(frame, damage_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.8, (255, 255, 255), 2, cv2.LINE_AA)
     
     def _draw_hit_effects(self, frame):
-        """Draw hit effect animations"""
+        """Draw hit effect animations with game-style effects"""
         current_time = time.time()
         effects_to_remove = []
         
@@ -461,101 +535,142 @@ class BoxingGameDetector:
             # Animation progress (0 to 1)
             progress = time_elapsed / effect['duration']
             
-            # Growing circle effect
-            radius = int(20 + progress * 30)
+            # Multiple effect layers for game feel
             alpha = 1.0 - progress
             
-            # Color based on zone
+            # Expanding square effect
+            size = int(20 + progress * 60)
+            half_size = size // 2
+            
+            # Color based on zone with intensity
             if effect['zone'] == 'HEAD':
-                color = (0, 0, int(255 * alpha))
+                color = (int(255 * alpha), int(100 * alpha), int(100 * alpha))
             else:
-                color = (0, int(255 * alpha), int(255 * alpha))
+                color = (int(100 * alpha), int(255 * alpha), int(255 * alpha))
             
-            # Draw effect
-            cv2.circle(frame, effect['pos'], radius, color, 3)
+            # Draw expanding square
+            top_left = (effect['pos'][0] - half_size, effect['pos'][1] - half_size)
+            bottom_right = (effect['pos'][0] + half_size, effect['pos'][1] + half_size)
+            cv2.rectangle(frame, top_left, bottom_right, color, 3)
             
-            # Draw damage text
-            text_pos = (effect['pos'][0] - 20, effect['pos'][1] - radius - 10)
-            cv2.putText(frame, f"-{effect['damage']}", text_pos, 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            # Inner flash effect
+            if progress < 0.3:  # Flash for first 30% of animation
+                flash_alpha = (0.3 - progress) / 0.3
+                flash_color = (int(255 * flash_alpha), int(255 * flash_alpha), int(255 * flash_alpha))
+                inner_size = int(size * 0.6)
+                inner_half = inner_size // 2
+                cv2.rectangle(frame, 
+                            (effect['pos'][0] - inner_half, effect['pos'][1] - inner_half),
+                            (effect['pos'][0] + inner_half, effect['pos'][1] + inner_half),
+                            flash_color, -1)
+            
+            # Damage text with outline
+            damage_text = f"-{effect['damage']}"
+            text_y = effect['pos'][1] - size - 20
+            text_size = cv2.getTextSize(damage_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
+            text_pos = (effect['pos'][0] - text_size[0]//2, text_y)
+            
+            # Text outline
+            cv2.putText(frame, damage_text, text_pos, 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5, cv2.LINE_AA)
+            # Text fill
+            cv2.putText(frame, damage_text, text_pos, 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3, cv2.LINE_AA)
         
         # Remove expired effects
         for i in reversed(effects_to_remove):
             del self.hit_effects[i]
     
     def _draw_hud(self, frame):
-        """Draw heads-up display"""
+        """Draw minimal game-style HUD"""
         h, w = frame.shape[:2]
         
-        # Health bar
-        bar_width = 300
-        bar_height = 30
-        bar_x = w - bar_width - 20
-        bar_y = 20
+        # Health bar - top right
+        bar_width = 250
+        bar_height = 20
+        bar_x = w - bar_width - 30
+        bar_y = 30
         
-        # Health bar background
+        # Health bar background with border
+        cv2.rectangle(frame, (bar_x-2, bar_y-2), (bar_x + bar_width+2, bar_y + bar_height+2), 
+                     (255, 255, 255), 1)
         cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), 
-                     (50, 50, 50), -1)
+                     (40, 40, 40), -1)
         
-        # Health bar fill
-        health_width = int((self.mannequin_health / self.max_health) * bar_width)
-        health_color = (0, 255, 0) if self.mannequin_health > 50 else (0, 165, 255) if self.mannequin_health > 25 else (0, 0, 255)
-        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + health_width, bar_y + bar_height), 
-                     health_color, -1)
+        # Health bar fill with color coding
+        if self.mannequin_health > 0:
+            health_width = int((self.mannequin_health / self.max_health) * bar_width)
+            if self.mannequin_health > 60:
+                health_color = (0, 255, 0)
+            elif self.mannequin_health > 30:
+                health_color = (0, 255, 255)
+            else:
+                health_color = (0, 100, 255)
+            
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + health_width, bar_y + bar_height), 
+                         health_color, -1)
         
         # Health text
-        health_text = f"MANNEQUIN HP: {self.mannequin_health}/{self.max_health}"
-        cv2.putText(frame, health_text, (bar_x, bar_y - 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        health_text = f"{self.mannequin_health}/{self.max_health} HP"
+        cv2.putText(frame, health_text, (bar_x, bar_y - 8), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
         
-        # Score and combo
-        cv2.putText(frame, f"SCORE: {self.score}", (20, 30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+        # Score - top left
+        score_text = f"SCORE: {self.score:,}"
+        cv2.putText(frame, score_text, (30, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
         
+        # Combo - below score
         if self.combo_count > 1:
-            combo_color = (0, 255, 255) if self.combo_count < 5 else (255, 0, 255)
-            cv2.putText(frame, f"COMBO x{self.combo_count}!", (20, 70), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, combo_color, 2)
+            combo_color = (0, 255, 255) if self.combo_count < 5 else (255, 100, 255)
+            combo_text = f"COMBO x{self.combo_count}!"
+            cv2.putText(frame, combo_text, (30, 85), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, combo_color, 2, cv2.LINE_AA)
         
-        # Instructions
-        instructions = [
-            "🥊 BOXING TRAINER",
-            "Punch the highlighted zones!",
-            "HEAD: 20 dmg | CHEST: 15 dmg",
-            f"FPS: {self.current_fps:.1f}"
-        ]
+        # Boss info - center top
+        if self.campaign_active and self.bosses:
+            boss = self.bosses[self.current_boss_index]
+            boss_text = f"{boss.name}"
+            text_size = cv2.getTextSize(boss_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+            text_x = (w - text_size[0]) // 2
+            
+            # Boss name with outline
+            cv2.putText(frame, boss_text, (text_x, 45), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(frame, boss_text, (text_x, 45), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 255), 2, cv2.LINE_AA)
         
-        for i, instruction in enumerate(instructions):
-            cv2.putText(frame, instruction, (20, h - 100 + i * 25), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # ESP32 status - bottom left corner
+        status_color = (0, 255, 0) if self.esp32_connected else (0, 0, 255)
+        status_text = "●" if self.esp32_connected else "●"
+        cv2.putText(frame, status_text, (30, h - 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2, cv2.LINE_AA)
+        cv2.putText(frame, "ESP32", (55, h - 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         
         # Victory message
-        # Show knockout / boss defeated and campaign progression
         if self.mannequin_health <= 0:
             if self.campaign_active:
                 boss = self.bosses[self.current_boss_index]
-                msg = f"KNOCKOUT! {boss.name} defeated"
+                msg = f"{boss.name} DEFEATED!"
             else:
                 msg = "KNOCKOUT!"
 
             victory_text = f"🏆 {msg} 🏆"
-            text_size = cv2.getTextSize(victory_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
+            text_size = cv2.getTextSize(victory_text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 4)[0]
             text_x = (w - text_size[0]) // 2
             text_y = h // 2
 
-            # Background
-            cv2.rectangle(frame, (text_x - 20, text_y - 30), 
-                         (text_x + text_size[0] + 20, text_y + 10), (0, 0, 0), -1)
+            # Victory background
+            padding = 30
+            cv2.rectangle(frame, (text_x - padding, text_y - 40), 
+                         (text_x + text_size[0] + padding, text_y + 20), (0, 0, 0), -1)
+            cv2.rectangle(frame, (text_x - padding, text_y - 40), 
+                         (text_x + text_size[0] + padding, text_y + 20), (0, 255, 0), 3)
 
-            # Text
+            # Victory text
             cv2.putText(frame, victory_text, (text_x, text_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-        # Draw current boss info
-        if self.campaign_active and self.bosses:
-            boss = self.bosses[self.current_boss_index]
-            boss_text = f"BOSS {self.current_boss_index+1}/ {len(self.bosses)}: {boss.name}"
-            cv2.putText(frame, boss_text, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4, cv2.LINE_AA)
 
     def _draw_cutscene_overlay(self, frame):
         """Draw a full-screen overlay for in-app cutscenes (3s)."""
@@ -645,6 +760,123 @@ class BoxingGameDetector:
         pct = min(1.0, max(0.0, elapsed / self.cutscene_overlay['duration']))
         cv2.rectangle(frame, (bx, by), (bx + int(bar_w * (1 - pct)), by + bar_h), (0, 180, 0), -1)
     
+    def _render_fullscreen_cutscene(self, frame: np.ndarray) -> np.ndarray:
+        """Render cutscene in fullscreen mode with no interruptions"""
+        h, w = frame.shape[:2]
+        
+        # Create a black fullscreen canvas
+        cutscene_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Check if cutscene should end
+        elapsed = time.time() - self.cutscene_overlay['start_time']
+        if elapsed >= self.cutscene_overlay['duration']:
+            print(f"🎬 Cutscene finished after {elapsed:.1f}s, advancing to next boss")
+            self.cutscene_overlay['active'] = False
+            self.cutscene_playing = False
+            self._advance_to_next_boss()
+            return cutscene_frame
+        
+        # Try to load and display video
+        cutscene_path = self.cutscene_overlay.get('video_path')
+        
+        if cutscene_path and os.path.exists(cutscene_path):
+            try:
+                # Initialize video capture ONCE at the start of cutscene
+                if not hasattr(self, '_cutscene_cap') or self._cutscene_cap is None:
+                    print(f"🎬 Initializing video capture for: {cutscene_path}")
+                    self._cutscene_cap = cv2.VideoCapture(cutscene_path)
+                    
+                    if not self._cutscene_cap.isOpened():
+                        print(f"❌ Failed to open video: {cutscene_path}")
+                        self._cutscene_cap = None
+                        # Fall through to text display
+                    else:
+                        print(f"✅ Video capture initialized successfully")
+                
+                # Read next frame sequentially (no seeking)
+                if self._cutscene_cap and self._cutscene_cap.isOpened():
+                    ret, video_frame = self._cutscene_cap.read()
+                    
+                    if ret and video_frame is not None:
+                        # Resize video to fill screen while maintaining aspect ratio
+                        video_h, video_w = video_frame.shape[:2]
+                        
+                        # Calculate scaling to fit screen
+                        scale_w = w / video_w
+                        scale_h = h / video_h
+                        scale = min(scale_w, scale_h)
+                        
+                        new_w = int(video_w * scale)
+                        new_h = int(video_h * scale)
+                        
+                        # Resize video frame
+                        resized_video = cv2.resize(video_frame, (new_w, new_h))
+                        
+                        # Center the video on the screen
+                        start_x = (w - new_w) // 2
+                        start_y = (h - new_h) // 2
+                        end_x = start_x + new_w
+                        end_y = start_y + new_h
+                        
+                        # Place video on the cutscene frame
+                        cutscene_frame[start_y:end_y, start_x:end_x] = resized_video
+                        
+                        # Add progress bar at bottom
+                        progress = elapsed / self.cutscene_overlay['duration']
+                        bar_width = int(w * 0.8 * progress)
+                        bar_y = h - 30
+                        cv2.rectangle(cutscene_frame, (w//10, bar_y), 
+                                     (w//10 + int(w * 0.8), bar_y + 10), (60, 60, 60), -1)
+                        cv2.rectangle(cutscene_frame, (w//10, bar_y), 
+                                     (w//10 + bar_width, bar_y + 10), (0, 255, 0), -1)
+                        
+                        return cutscene_frame
+                        
+                    else:
+                        # Video ended or failed to read, show text for remaining time
+                        if self._cutscene_cap:
+                            self._cutscene_cap.release()
+                            self._cutscene_cap = None
+                        # Fall through to text display
+                        
+            except Exception as e:
+                print(f"❌ Video playback error: {e}")
+                if hasattr(self, '_cutscene_cap') and self._cutscene_cap:
+                    self._cutscene_cap.release()
+                    self._cutscene_cap = None
+                # Fall through to text display
+        
+        # Text fallback display
+        boss_name = self.cutscene_overlay.get('boss_name', 'BOSS')
+        text = f"{boss_name} Defeated!"
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 2, 3)[0]
+        text_x = (w - text_size[0]) // 2
+        text_y = h // 2
+        cv2.putText(cutscene_frame, text, (text_x, text_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+        
+        # Add some visual flair with animated background
+        progress = elapsed / self.cutscene_overlay['duration']
+        
+        # Animated circles
+        for i in range(5):
+            radius = int(50 + i * 30 + progress * 100)
+            alpha = max(0, 1.0 - progress - i * 0.1)
+            color_intensity = int(255 * alpha * 0.3)
+            if color_intensity > 0:
+                cv2.circle(cutscene_frame, (w//2, h//2), radius, 
+                          (0, color_intensity, 0), 2)
+        
+        # Progress bar
+        bar_width = int(w * 0.8 * progress)
+        bar_y = h//2 + 100
+        cv2.rectangle(cutscene_frame, (w//10, bar_y), 
+                     (w//10 + int(w * 0.8), bar_y + 20), (60, 60, 60), -1)
+        cv2.rectangle(cutscene_frame, (w//10, bar_y), 
+                     (w//10 + bar_width, bar_y + 20), (0, 255, 0), -1)
+        
+        return cutscene_frame
+
     def _update_game_state(self):
         """Update game state"""
         current_time = time.time()
@@ -652,6 +884,27 @@ class BoxingGameDetector:
         # Reset combo if timeout exceeded
         if (current_time - self.last_hit_time) > self.combo_timeout:
             self.combo_count = 0
+        
+        # Check for boss defeat (health reached 0) even if not from direct hit
+        if (self.mannequin_health <= 0 and self.campaign_active and 
+            not self.cutscene_playing and 
+            not self.bosses[self.current_boss_index].defeated):
+            
+            # Mark boss defeated
+            current_boss = self.bosses[self.current_boss_index]
+            current_boss.defeated = True
+            print(f"🎉 Boss defeated: {current_boss.name} (Health: {self.mannequin_health})")
+            
+            # Play cutscene (non-blocking start)
+            try:
+                self.cutscene_playing = True
+                self._play_cutscene(current_boss)
+                print(f"🎬 Starting cutscene for {current_boss.name}")
+            except Exception as e:
+                print(f"Cutscene playback error: {e}")
+                # Immediately advance if cutscene failed
+                print("⚠️ Cutscene failed, advancing to next boss")
+                self._advance_to_next_boss()
         
         # Regeneration removed for campaign mode — mannequin does not auto-heal
         # (Previously: slow auto-heal after 5s with +1 HP). Kept intentionally off.
@@ -674,12 +927,7 @@ class BoxingGameDetector:
     def reset_game(self, reset_campaign: bool = False):
         """Reset game state. If reset_campaign True, reset campaign progress as well."""
         # Reset current boss state
-        self.mannequin_health = self.max_health
-        self.score = 0
-        self.combo_count = 0
-        self.hit_effects.clear()
-        print("🔄 Game Reset!")
-
+        current_health = self.max_health
         if reset_campaign:
             # Reset campaign to first boss
             for b in self.bosses:
@@ -687,10 +935,55 @@ class BoxingGameDetector:
             self.current_boss_index = 0
             if self.bosses:
                 self.max_health = self.bosses[0].max_health
-                self.mannequin_health = self.max_health
+                current_health = self.max_health
             self.campaign_active = True
             print("🔁 Campaign Reset to Boss 1")
+        
+        # Set ESP32 health to reset value
+        print(f"🔄 Resetting ESP32 health to: {current_health}")
+        if self._set_esp32_health(current_health):
+            self.mannequin_health = current_health
+            print(f"✅ ESP32 health reset successful")
+        else:
+            print("⚠️ Failed to reset ESP32 health, using local value")
+            self.mannequin_health = current_health
+        
+        self.score = 0
+        self.combo_count = 0
+        self.hit_effects.clear()
+        # Reset zone positioning for fresh start
+        self.zones_need_repositioning = True
+        self.base_zones = []
+        print("🔄 Game Reset!")
 
+    def initialize_esp32_health(self):
+        """Initialize ESP32 health to starting boss health"""
+        if self.bosses:
+            initial_health = self.bosses[0].max_health
+            print(f"🚀 Initializing game - Setting ESP32 health to {initial_health}")
+            
+            # Try up to 3 times to set initial health
+            for attempt in range(3):
+                success = self._set_esp32_health(initial_health)
+                if success:
+                    print("✅ ESP32 health initialization successful")
+                    with self.esp32_lock:
+                        self.mannequin_health = initial_health
+                        self.previous_health = initial_health  # Update previous health
+                    return True
+                else:
+                    print(f"⚠️ ESP32 health initialization attempt {attempt + 1} failed")
+                    if attempt < 2:  # Don't sleep on last attempt
+                        time.sleep(1.0)
+            
+            print("❌ ESP32 health initialization failed after 3 attempts")
+            # Set local health anyway
+            with self.esp32_lock:
+                self.mannequin_health = initial_health
+                self.previous_health = initial_health  # Update previous health
+            return False
+        return False
+        
     # ---------------- Campaign helpers ----------------
     def _init_campaign(self):
         """Initialize campaign bosses. Try loading 'campaign.json' in workspace; otherwise use built-in list."""
@@ -722,21 +1015,21 @@ class BoxingGameDetector:
                 print(f"Failed to load campaign.json: {e}")
 
         if not loaded:
-            # Fallback built-in list
-            custom_names = [
-                "COWBOY BOB",
-                "SIR ROYAL BOB",
-                "EVIL BOBBY",
-                "FANCY BOB",
-                "RICH BOB",
+            # Fallback built-in list with correct video file paths
+            custom_bosses = [
+                ("COWBOY BOB", "cutscenes/Money_Bob.mp4"),
+                ("SIR ROYAL BOB", "cutscenes/Sir_Royal_Bob.mp4"), 
+                ("EVIL BOBBY", "cutscenes/Evil_Bobby.mp4"),
+                ("FANCY BOB", "cutscenes/Fancy_Bob.mp4"),
+                ("RICH BOB", "cutscenes/Money_Bob.mp4"),  # Reuse Money_Bob for Rich Bob
             ]
 
-            for i, name in enumerate(custom_names):
+            for i, (name, video_file) in enumerate(custom_bosses):
                 boss = Boss(
                     name=name,
                     max_health=100 + i * 50,
                     portrait=None,
-                    cutscene=f"cutscenes/boss{i+1}.mp4",
+                    cutscene=video_file,
                     defeated=False
                 )
                 self.bosses.append(boss)
@@ -746,57 +1039,85 @@ class BoxingGameDetector:
             self.current_boss_index = 0
             self.max_health = self.bosses[0].max_health
             self.mannequin_health = self.max_health
+            # Don't set ESP32 health here - it will be done by initialize_esp32_health()
 
     def _play_cutscene(self, boss: Boss):
         """In-app cutscene overlay: play the video's frames inside the main window.
         If ffplay is available, attempt to play audio in background (no external video window).
         """
+        print(f"🎬 Playing cutscene for {boss.name}")
         file = boss.cutscene
         portrait = boss.portrait if boss.portrait and os.path.isfile(boss.portrait) else None
+
+        # Clean up any previous video capture
+        if hasattr(self, '_cutscene_cap') and self._cutscene_cap is not None:
+            self._cutscene_cap.release()
+            self._cutscene_cap = None
 
         # Initialize overlay state
         self.cutscene_overlay['active'] = True
         self.cutscene_overlay['boss_name'] = boss.name
         self.cutscene_overlay['start_time'] = time.time()
         self.cutscene_overlay['portrait'] = portrait
-        self.cutscene_overlay['video_cap'] = None
+        self.cutscene_overlay['video_path'] = file
         self.cutscene_overlay['audio_proc'] = None
+        self.cutscene_overlay['duration'] = 4.0  # Default duration with buffer
 
         # Try opening video file for integrated playback
         if file and os.path.isfile(file):
+            print(f"📁 Found cutscene file: {file}")
             try:
-                cap = cv2.VideoCapture(file)
-                if cap.isOpened():
-                    self.cutscene_overlay['video_cap'] = cap
-                    # set duration to video length if available
+                # Set video path for fullscreen renderer
+                self.cutscene_overlay['video_path'] = file
+                print(f"🎬 Set video path: {file}")
+                
+                # Get video duration for proper timing
+                temp_cap = cv2.VideoCapture(file)
+                if temp_cap.isOpened():
                     try:
-                        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        frames = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                        fps = temp_cap.get(cv2.CAP_PROP_FPS) or 30.0
                         if frames > 0 and fps > 0:
-                            self.cutscene_overlay['duration'] = max(3.0, frames / fps)
-                    except Exception:
-                        pass
+                            video_duration = frames / fps
+                            # Add 1 second buffer for smooth transitions
+                            self.cutscene_overlay['duration'] = max(4.0, video_duration + 1.0)
+                            print(f"🎞️ Video duration: {video_duration:.1f}s (with buffer: {self.cutscene_overlay['duration']:.1f}s)")
+                    except Exception as e:
+                        print(f"Error getting video duration: {e}")
+                    temp_cap.release()
 
                     # Try to play audio in background using ffplay (no display)
                     try:
-                        proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        proc = subprocess.Popen(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file], 
+                                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         self.cutscene_overlay['audio_proc'] = proc
+                        print("🔊 Audio playback started")
                     except Exception:
                         # audio not available; ignore
                         self.cutscene_overlay['audio_proc'] = None
+                        print("🔇 No audio playback available")
                 else:
-                    cap.release()
-            except Exception:
-                self.cutscene_overlay['video_cap'] = None
+                    print("⚠️ Failed to open video file for inspection")
+            except Exception as e:
+                print(f"⚠️ Video processing error: {e}")
+                self.cutscene_overlay['video_path'] = None
+        else:
+            print(f"📁 No cutscene file found at: {file}")
+            self.cutscene_overlay['video_path'] = None
 
-        # If no video cap and no portrait, fallback to 3s card
-        if not self.cutscene_overlay['video_cap'] and not portrait:
-            self.cutscene_overlay['duration'] = 3.0
+        # If no video and no portrait, use fallback duration
+        if not self.cutscene_overlay['video_path'] and not portrait:
+            print("🎭 Using default 4s boss card cutscene")
+            self.cutscene_overlay['duration'] = 4.0
 
         self.cutscene_playing = True
+        print(f"🎬 Cutscene started, duration: {self.cutscene_overlay['duration']:.1f}s")
 
     def _advance_to_next_boss(self):
         """Move campaign to the next boss or finish campaign"""
+        # Clean up cutscene resources
+        self._cleanup_cutscene()
+        
         # Advance index
         self.current_boss_index += 1
         if self.current_boss_index >= len(self.bosses):
@@ -810,12 +1131,187 @@ class BoxingGameDetector:
         # Setup next boss
         next_boss = self.bosses[self.current_boss_index]
         self.max_health = next_boss.max_health
-        self.mannequin_health = self.max_health
+        
+        # Reset zone positioning for new boss
+        self.zones_need_repositioning = True
+        self.base_zones = []
+        
+        # Set ESP32 health to new boss health and wait for confirmation
+        print(f"🎯 Setting ESP32 health for next boss: {next_boss.max_health}")
+        if self._set_esp32_health(next_boss.max_health):
+            self.mannequin_health = next_boss.max_health
+            self.previous_health = next_boss.max_health  # Update previous health
+            print(f"✅ ESP32 health set to {next_boss.max_health} for {next_boss.name}")
+        else:
+            print("⚠️ Failed to set ESP32 health, using local value")
+            self.mannequin_health = next_boss.max_health
+            self.previous_health = next_boss.max_health  # Update previous health
+        
         self.hit_effects.clear()
         self.combo_count = 0
         self.last_hit_time = 0
         print(f"➡️ Next boss: {next_boss.name} (HP: {next_boss.max_health})")
 
+    def _start_esp32_monitoring(self):
+        """Start background thread to monitor ESP32 health"""
+        self.esp32_running = True
+        self.esp32_thread = threading.Thread(target=self._esp32_health_monitor, daemon=True)
+        self.esp32_thread.start()
+        print("🔗 Started ESP32 health monitoring thread")
+    
+    def _esp32_health_monitor(self):
+        """Background thread to continuously fetch health from ESP32"""
+        while self.esp32_running:
+            try:
+                current_time = time.time()
+                if current_time - self.esp32_last_fetch >= self.esp32_fetch_interval:
+                    health = self._fetch_esp32_health()
+                    if health is not None:
+                        with self.esp32_lock:
+                            # Check if health has changed to trigger zone repositioning
+                            if health != self.previous_health:
+                                print(f"🔄 Health changed from {self.previous_health} to {health} - repositioning hit zones")
+                                self.zones_need_repositioning = True
+                                self.previous_health = health
+                            
+                            self.esp32_health = health
+                            self.mannequin_health = health  # Sync local cache
+                            if not self.esp32_connected:
+                                self.esp32_connected = True
+                                print("✅ ESP32 connected successfully")
+                    else:
+                        if self.esp32_connected:
+                            self.esp32_connected = False
+                            print("❌ ESP32 connection lost")
+                    
+                    self.esp32_last_fetch = current_time
+                
+                time.sleep(0.05)  # Small sleep to prevent CPU overload
+            except Exception as e:
+                print(f"ESP32 monitoring error: {e}")
+                time.sleep(1.0)  # Longer sleep on error
+    
+    def _fetch_esp32_health(self):
+        """Fetch current health from ESP32"""
+        try:
+            response = requests.get(f"http://{self.esp32_ip}/status", timeout=0.5)
+            if response.status_code == 200:
+                data = response.json()
+                # New API format: {"currentNetForce":3.060,"maxForceScore":4.446,"bossHealth":96.583,"bossMaxHealth":100.000}
+                boss_health = data.get('bossHealth', None)
+                if boss_health is not None:
+                    return int(boss_health)  # Convert to integer for game display
+                # Fallback to old format
+                return data.get('health', None)
+        except Exception as e:
+            # Silently handle connection errors for low latency
+            pass
+        return None
+    
+    def _set_esp32_health(self, health_value):
+        """Set health value on ESP32"""
+        try:
+            # Use POST method for setting health
+            response = requests.post(f"http://{self.esp32_ip}/set_health?value={health_value}", timeout=1.0)
+            if response.status_code == 200:
+                print(f"🎯 ESP32 health set to: {health_value}")
+                return True
+            else:
+                print(f"❌ ESP32 set health failed: HTTP {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"Failed to set ESP32 health: {e}")
+        return False
+    
+    def stop_esp32_monitoring(self):
+        """Stop ESP32 monitoring thread and cleanup resources"""
+        self.esp32_running = False
+        if self.esp32_thread and self.esp32_thread.is_alive():
+            self.esp32_thread.join(timeout=2.0)
+        print("🔗 ESP32 monitoring stopped")
+        
+        # Stop background music
+        self.stop_background_music()
+        
+        # Cleanup pygame
+        if self.music_initialized:
+            try:
+                pygame.mixer.quit()
+                print("🎵 Music system shutdown")
+            except Exception as e:
+                print(f"⚠️ Error shutting down music system: {e}")
+        
+    def _cleanup_cutscene(self):
+        """Clean up cutscene resources"""
+        if hasattr(self, '_cutscene_cap') and self._cutscene_cap is not None:
+            self._cutscene_cap.release()
+            self._cutscene_cap = None
+        
+        # Clean up audio process if running
+        if self.cutscene_overlay.get('audio_proc'):
+            try:
+                self.cutscene_overlay['audio_proc'].terminate()
+            except:
+                pass
+            self.cutscene_overlay['audio_proc'] = None
+
+    def _init_background_music(self):
+        """Initialize pygame mixer and load background music"""
+        try:
+            # Initialize pygame mixer for audio
+            pygame.mixer.pre_init(frequency=22050, size=-16, channels=2, buffer=512)
+            pygame.mixer.init()
+            self.music_initialized = True
+            print("🎵 Music system initialized")
+            
+            # Check if music file exists
+            if os.path.exists(self.music_file):
+                print(f"🎵 Found background music: {os.path.basename(self.music_file)}")
+            else:
+                print(f"⚠️ Background music file not found: {self.music_file}")
+                self.music_initialized = False
+                
+        except Exception as e:
+            print(f"⚠️ Failed to initialize music system: {e}")
+            self.music_initialized = False
+    
+    def start_background_music(self):
+        """Start playing background music in a loop"""
+        if not self.music_initialized:
+            print("⚠️ Music system not initialized")
+            return
+            
+        try:
+            if os.path.exists(self.music_file):
+                pygame.mixer.music.load(self.music_file)
+                pygame.mixer.music.set_volume(self.music_volume)
+                pygame.mixer.music.play(-1)  # -1 means loop indefinitely
+                self.music_playing = True
+                print(f"🎵 Started background music (Volume: {int(self.music_volume * 100)}%)")
+            else:
+                print(f"⚠️ Cannot start music: file not found: {self.music_file}")
+        except Exception as e:
+            print(f"⚠️ Failed to start background music: {e}")
+    
+    def stop_background_music(self):
+        """Stop background music"""
+        if self.music_initialized and self.music_playing:
+            try:
+                pygame.mixer.music.stop()
+                self.music_playing = False
+                print("🎵 Stopped background music")
+            except Exception as e:
+                print(f"⚠️ Failed to stop background music: {e}")
+    
+    def set_music_volume(self, volume: float):
+        """Set background music volume (0.0 to 1.0)"""
+        if self.music_initialized and self.music_playing:
+            try:
+                self.music_volume = max(0.0, min(1.0, volume))
+                pygame.mixer.music.set_volume(self.music_volume)
+                print(f"🔊 Music volume set to {int(self.music_volume * 100)}%")
+            except Exception as e:
+                print(f"⚠️ Failed to set music volume: {e}")
 
 def create_boxing_pipeline():
     """Create simplified DepthAI pipeline for boxing game"""
@@ -862,6 +1358,13 @@ def main():
 
     # Initialize game
     boxing_game = BoxingGameDetector()
+    
+    # Start background music
+    boxing_game.start_background_music()
+    
+    # Wait a moment for ESP32 initialization to complete
+    print("🔄 Initializing ESP32 connection...")
+    time.sleep(1.5)
 
     try:
         pipeline = create_boxing_pipeline()
@@ -881,6 +1384,9 @@ def main():
         print("  'r' = reset current boss")
         print("  'c' = reset entire campaign")
         print("  'f' = toggle fullscreen")
+        print("  '+' = increase music volume")
+        print("  '-' = decrease music volume")
+        print("  'm' = toggle music on/off")
         print("🎯 Position mannequin in view and start punching!\n")
 
         window_name = "🥊 OAK Boxing Trainer"
@@ -953,6 +1459,17 @@ def main():
                     else:
                         cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
                         print("🖥️ Fullscreen: OFF")
+                elif key == ord('+') or key == ord('='):  # Handle both + and = keys
+                    new_volume = min(1.0, boxing_game.music_volume + 0.1)
+                    boxing_game.set_music_volume(new_volume)
+                elif key == ord('-'):
+                    new_volume = max(0.0, boxing_game.music_volume - 0.1)
+                    boxing_game.set_music_volume(new_volume)
+                elif key == ord('m'):
+                    if boxing_game.music_playing:
+                        boxing_game.stop_background_music()
+                    else:
+                        boxing_game.start_background_music()
                 elif key == 27:  # ESC
                     if fullscreen_mode:
                         fullscreen_mode = False
@@ -964,6 +1481,7 @@ def main():
                 continue
         
         device.close()
+        boxing_game.stop_esp32_monitoring()
         return True
         
     except Exception as e:
