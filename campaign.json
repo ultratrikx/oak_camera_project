@@ -1,0 +1,32 @@
+[
+  {
+    "name": "COWBOY BOB",
+    "max_health": 100,
+    "cutscene": "cutscenes/boss.mp4",
+    "portrait": null
+  },
+  {
+    "name": "SIR ROYAL BOB",
+    "max_health": 150,
+    "cutscene": "cutscenes/boss.mp4",
+    "portrait": null
+  },
+  {
+    "name": "EVIL BOBBY",
+    "max_health": 200,
+    "cutscene": "cutscenes/boss.mp4",
+    "portrait": null
+  },
+  {
+    "name": "FANCY BOB",
+    "max_health": 250,
+    "cutscene": "cutscenes/boss.mp4",
+    "portrait": null
+  },
+  {
+    "name": "RICH BOB",
+    "max_health": 300,
+    "cutscene": "cutscenes/boss.mp4",
+    "portrait": null
+  }
+]
